@@ -38,7 +38,7 @@ I chose CoT distillation specifically because it teaches a small student to imit
 
 ## Training curve
 
-![Loss curve](loss_curve_polished.png)
+![Loss curve](loss_curve.png)
 
 Train loss decreased monotonically across 3 epochs (0.798 → 0.755 → 0.740) with eval loss tracking closely (0.774 → 0.750 → 0.747), indicating successful learning without overfitting. The plateau in epochs 2–3 is consistent with the model approaching its representational capacity ceiling at 360M scale — additional training would yield diminishing returns.
 
