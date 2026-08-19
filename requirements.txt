@@ -1,6 +1,19 @@
+# Pinned because transformers and peft both moved their LoRA and chat-template
+# APIs around these releases. Newer versions likely work; these are what the
+# reported numbers came from.
 transformers==4.45.2
 peft==0.13.2
 datasets==3.0.1
 accelerate==1.0.1
 anthropic
 torch>=2.0
+
+# Deliberately absent:
+#   bitsandbytes - Kaggle's preinstalled triton breaks its import path, and
+#                  bf16 LoRA on a 360M model has no use for 8-bit anyway.
+#                  The notebook uninstalls it explicitly.
+#   trl          - transformers.Trainer + peft directly is the same job with
+#                  fewer layers between the config and the optimizer step.
+#
+# Assumed preinstalled (they are, on Kaggle): numpy, matplotlib, tqdm,
+# huggingface_hub. Add them here if you are running outside a Kaggle image.

@@ -1,59 +1,99 @@
 # Chain-of-Thought Distillation: SmolLM2-360M ← Claude Haiku 4.5
 
-> Distilling chain-of-thought reasoning from Claude Haiku 4.5 onto a 360M-parameter open-weight model, with a focus on understanding what distillation transfers — and what it doesn't — at small scale.
+Fine-tuning a 360M-parameter open model on chain-of-thought solutions written by Claude Haiku 4.5, and measuring carefully what that actually buys you on GSM8K.
 
-[**Model on HuggingFace**](https://huggingface.co/kianshandi/smollm2-360m-gsm8k-distilled-haiku) · **Trained on:** 1 × Kaggle T4 (free tier) · **API cost:** ~$3
+Short version: it buys you the teacher's format almost perfectly and its arithmetic barely at all. Accuracy went from 10.5% to 12.5% on 200 held-out problems, which is inside the noise band for a test set that size. The formatting transfer, by contrast, is unambiguous: 95% of the fine-tuned model's outputs end in a `#### <number>` answer marker, against a baseline that frequently trails off mid-sentence without committing to an answer at all.
+
+[Model on HuggingFace](https://huggingface.co/kianshandi/smollm2-360m-gsm8k-distilled-haiku) · Trained on one Kaggle T4 (free tier) · ~$2.70 in API spend
 
 ---
 
-## TL;DR
+## Results
 
-Trained `SmolLM2-360M-Instruct` on 1,435 chain-of-thought solutions distilled from Claude Haiku 4.5 on GSM8K math problems. After training:
-
-| | Accuracy on 200 held-out GSM8K | 95% CI |
+| | Accuracy (200 held-out GSM8K) | 95% CI |
 |---|---|---|
-| **Baseline** | 10.5% | [6.5%, 14.5%] |
-| **Fine-tuned** | **12.5%** | [8.0%, 17.5%] |
-| **Paired Δ** | +2.0pp (1.19×) | [-3.0pp, 7.0pp] |
+| SmolLM2-360M-Instruct, as released | 10.5% | [6.5%, 14.5%] |
+| + LoRA SFT on 1,435 Haiku CoTs | 12.5% | [8.0%, 17.5%] |
+| Paired difference | +2.0pp | [−3.0pp, +7.0pp] |
 
-The accuracy gain is modest and **not statistically significant** at this sample size (paired bootstrap p ≈ 0.241). However, the qualitative analysis tells a different and more interesting story: the model cleanly adopted Claude's reasoning structure — bolded step headers, explicit arithmetic, `####` answer markers, structured progressions — even when its underlying arithmetic capacity remained the bottleneck.
+Paired bootstrap over per-problem outcomes, 2,000 resamples: P(fine-tuned ≤ baseline) ≈ 0.241. Four extra correct answers out of 200. The interval covers zero comfortably, so the honest statement is that this experiment did not establish that distillation helped accuracy, not that it helped a little.
 
-**The headline finding isn't the +2pp number. It's that distillation at small scale is best understood as *style transfer*, not *capability transfer*.**
+That is worth sitting with, because the same recipe scaled up (DeepSeek-R1's distillation into 7B–70B students, Phi's textbook-style curricula) produces large, obvious gains. Something about 360M is different, and the qualitative side of the eval says what.
 
----
+## What's in here
 
-## Why this project
+| Path | What it is |
+|---|---|
+| `smollm2_cot_distillation_polished.ipynb` | The whole pipeline: generation, filtering, training, eval, stats, plots. Runs top to bottom on a Kaggle T4. |
+| `loss_curve.png` | Train/eval loss over the 3 epochs, exported from the notebook. |
+| `requirements.txt` | Pinned versions. The pins matter; see the setup note below. |
 
-I'd shipped LLM-API-based projects before — wrappers around Claude and Gemini for various downstream tasks — but I'd never trained a model end-to-end. I wanted to fill that gap with something concrete: real fine-tuning, real eval rigor, and a real artifact.
-
-I chose CoT distillation specifically because it teaches a small student to imitate a frontier teacher's reasoning style, which is a current research direction (e.g., DeepSeek-Math, Phi). I chose SmolLM2-360M as the base because it fits cleanly on a free Kaggle T4 and is small enough to expose the *capability ceiling* of distillation as a method — which turned out to be the most interesting finding.
+There is no `src/` directory because there is no library here. It is one experiment, and one notebook is the honest shape for it.
 
 ## Pipeline
 
-1. **Generate** 1,500 CoT solutions to GSM8K training problems with Claude Haiku 4.5 (~$2.70 in API costs)
-2. **Filter** via rejection sampling — keep only CoTs whose final answer matches gold (95.7% acceptance, 1,435 kept)
-3. **SFT-LoRA fine-tune** SmolLM2-360M on (question, CoT) pairs (LoRA rank 16 on attention projections, 3 epochs, ~20 min on T4)
-4. **Evaluate** baseline and fine-tuned models on 200 held-out problems from GSM8K's test split with greedy decoding
-5. **Analyze** with paired bootstrap CIs and qualitative side-by-side comparisons
+**1. Generate.** 1,500 GSM8K training problems (shuffled with `random.seed(7)`) go to `claude-haiku-4-5` with a system prompt asking for step-by-step reasoning ending in `#### <number>`, plus three few-shot demonstrations. Roughly 45 minutes wall clock and about $2.70: ~600 input tokens per call once you count the system prompt and few-shot block, ~250 output tokens, at Haiku's $1/$5 per million.
 
-## Training curve
+**2. Filter.** Keep only CoTs whose extracted final answer matches the GSM8K gold answer. 1,435 of 1,500 survive (95.7%). Standard rejection sampling; the student never sees a chain that ended in the wrong place.
+
+**3. Train.** LoRA (r=16, α=32) over `q_proj`, `k_proj`, `v_proj`, `o_proj`, 3 epochs, effective batch 16, cosine schedule from 2e-4 with 5% warmup, bf16. About 260 optimizer steps and 20 minutes on a T4. The adapter is a few megabytes against a 720MB bf16 checkpoint, which is most of why LoRA is the right call here even though the model is small enough to full-fine-tune.
+
+**4. Evaluate.** 200 problems from GSM8K's *test* split (`random.seed(42)`), greedy decoding, 512 max new tokens, batched at 8 with left-padding. The identical harness grades both models.
+
+**5. Analyze.** Marginal and paired bootstrap CIs, then a side-by-side read of wins, regressions, and the cases where both models were wrong but for different reasons.
+
+## The grader, and why it is the load-bearing part
+
+Everything downstream is a comparison of two numbers produced by the same function, so that function is where bugs do the most damage. It appears three times in the pipeline: filtering Claude's output, grading the baseline, grading the fine-tuned model. Defining it once is not tidiness, it is the only way the delta means anything.
+
+```python
+def extract_answer(text):
+    m = re.search(r"\\boxed\{([^}]+)\}", text)          # 1. LaTeX box
+    if m: return _normalize(m.group(1))
+    m = re.search(r"####\s*(-?[\d,]+\.?\d*)", text)     # 2. GSM8K marker
+    if m: return _normalize(m.group(1))
+    m = re.search(r"answer is\s*\$?(-?[\d,]+\.?\d*)", text, re.IGNORECASE)
+    if m: return _normalize(m.group(1))
+    nums = re.findall(r"-?[\d,]+\.?\d*", text)          # 4. last number, in desperation
+    return _normalize(nums[-1]) if nums else None
+```
+
+Two properties of this are deliberate and both cut against the result I reported:
+
+*The last-number fallback favors the baseline.* An untrained SmolLM2 that rambles through six numbers and stops gets credit if the last one happens to be right. The fine-tuned model, which commits to one number after `####`, gets no such lottery ticket. If anything this deflates the measured gain rather than inflating it.
+
+*`answers_match` is lenient about units, and that leniency is coarse.* It exists because Haiku kept reasoning in cents while GSM8K's gold was in dollars, both correct, string comparison says no:
+
+```python
+for ratio in [100, 60, 24, 12, 1000, 7, 52, 365]:
+    if g != 0 and abs(p / g - ratio) < 1e-4: return True
+    if p != 0 and abs(g / p - ratio) < 1e-4: return True
+```
+
+This accepts any answer off by exactly one of those ratios, which means a genuinely wrong prediction of 700 against a gold of 7 is scored correct. I kept it because dropping it silently discarded ~5% of otherwise-good teacher CoTs, and because both models are graded by the same function so the bias is common-mode. But it is a real source of false positives in both columns, and a stricter grader (unit-aware only where the question mentions money or time) is the first thing I would change.
+
+## Training
 
 ![Loss curve](loss_curve.png)
 
-Train loss decreased monotonically across 3 epochs (0.798 → 0.755 → 0.740) with eval loss tracking closely (0.774 → 0.750 → 0.747), indicating successful learning without overfitting. The plateau in epochs 2–3 is consistent with the model approaching its representational capacity ceiling at 360M scale — additional training would yield diminishing returns.
+Epoch-end eval loss: 0.774 → 0.750 → 0.747. Train loss opens at 1.49 and is already flat around 0.74 by step 70, which is roughly 1,100 examples in, less than one full epoch. Epochs 2 and 3 buy almost nothing. Eval tracks train the whole way, so nothing is overfitting; the model simply has nothing left to extract from the data. If I ran this again I would train one epoch and spend the saved GPU time on a larger eval set.
 
-## What the model actually learned
+One methodological wrinkle worth naming: the training labels are a straight copy of `input_ids`, so the loss covers the user's question as well as the assistant's solution. The usual practice is to mask the prompt tokens to `-100` and train only on the completion. With a fixed one-turn template and questions that are short relative to the CoTs the practical difference is small, but it does mean some capacity went into modeling GSM8K question phrasing rather than reasoning. That is an unforced error and it is fixable in about five lines.
 
-Even though headline accuracy moved only +2pp, the *qualitative* output transformation is dramatic:
+## What transferred
 
-**Baseline (untrained SmolLM2-360M) on a typing-speed problem:**
+The output change is large and immediate. Same problem, both models:
+
+**Baseline**
+
 ```
 The current measurement is 47 WPM.
 The next measurement is 52 WPM.
-The third measureme... [rambles, no clear final answer]
+The third measureme... [continues, never commits to an answer]
 ```
 
-**Fine-tuned model on the same problem:**
+**Fine-tuned**
+
 ```
 I need to find the average of the three measurements.
 
@@ -65,128 +105,139 @@ I need to find the average of the three measurements.
 #### 50
 ```
 
-The fine-tuned model produces correct **structure** — bolded step headers, explicit calculations, an answer marker — but commits an arithmetic/reading error (it misinterprets "+5 from 52" as a third value of 57 rather than a re-read of 52). It's wrong by 2, in a structurally clean way.
+That answer is wrong. The model read "5 more than the previous" as applying to a value it had already consumed, so it fabricated a third measurement. But look at what it got right: it stated the goal, laid out the givens under bolded headers, did the division explicitly, and emitted the answer marker. It failed in the shape of a correct solution.
 
-This pattern repeated across the held-out set:
+Across the held-out set:
 
-| Metric | Fine-tuned model |
+| | Fine-tuned |
 |---|---|
-| Outputs ending with `####` marker | 190 / 200 (95%) |
+| Outputs ending with a `####` marker | 190 / 200 (95%) |
 | Median generation length | 416 chars |
-| Outputs with bolded step structure | majority |
+| Bolded step headers | most outputs |
 
-Distillation transferred the **format** of reasoning reliably. It did not — and at this scale could not — transfer the underlying arithmetic capacity.
+Format is cheap to learn. It is a surface statistic over tokens, and 1,435 examples of it is plenty. Multi-step arithmetic is not a surface statistic, and no amount of scaffolding conjures it out of 360M parameters.
 
-## Failure mode analysis
+## Where it fails
 
-Inspecting the 175 wrong predictions revealed three distinct failure modes:
+Of the 175 wrong predictions, three patterns account for nearly all of them.
 
-1. **Off-by-N arithmetic errors.** The model picks a correct framework, walks the steps cleanly, but commits an arithmetic mistake mid-chain. (See typing-speed example above.)
+**Arithmetic slips inside a correct plan.** The model picks the right framework, walks it cleanly, and drops a digit somewhere in the middle. These are the most frustrating failures because everything except one operation is right, and they are exactly what a process reward model would catch.
 
-2. **Reading comprehension errors.** The model misinterprets the relationships between entities in the problem (e.g., conflating who-does-what or which value depends on which).
+**Misreading the problem.** Confusing who owns what, which quantity depends on which, whether a number is a total or a rate. This is a comprehension failure rather than a computation failure, and CoT formatting does nothing for it.
 
-3. **Repetition collapse.** ~5% of outputs entered degenerate loops mid-generation:
-   ```
-   ...5 footballs
-   **Half as many footballs as footballs kept there:**
-   5 footballs
-   **Half as many footballs as footballs kept there:**
-   5 footballs
-   ...
-   ```
-   These exhausted the 512-token budget without producing a final answer. Greedy decoding has no way to escape such loops; sampling with `temperature=0.3` was tested and gave essentially identical accuracy (12.0%), confirming the bottleneck is base-model capacity, not decoding strategy.
-
-## Statistical rigor
-
-Used paired bootstrap (n=2000) on per-problem differences rather than independent CIs, because the same 200 problems were graded under both models. This controls for the fact that some problems are intrinsically harder than others.
+**Repetition collapse.** Around 5% of generations fall into a loop:
 
 ```
-Baseline:    10.5%  [95% CI: 6.5%, 14.5%]
-Fine-tuned:  12.5%  [95% CI: 8.0%, 17.5%]
-Paired Δ:    +2.0pp [95% CI: -3.0pp, 7.0pp]
-P(fine-tuned ≤ baseline) ≈ 0.241
+...5 footballs
+**Half as many footballs as footballs kept there:**
+5 footballs
+**Half as many footballs as footballs kept there:**
+5 footballs
 ```
 
-The paired CI crosses zero, so the improvement is **not statistically distinguishable from noise at this sample size**. A larger held-out set (1000+ problems) would be needed to nail down the sign of the effect with confidence.
+These burn the full 512-token budget and never produce an answer. Greedy decoding has no escape from a high-confidence rut. I re-ran the eval with `temperature=0.3` sampling to check whether the loops were a decoding artifact; accuracy came out at 12.0%, statistically identical. Some loops broke, the answers still weren't right, which points at capacity rather than the sampler.
 
-I chose to report this honestly rather than reach for a more flattering number. The methodology is the artifact, not the outcome.
+## Statistics
 
-## Methodology notes worth flagging
+The 200 problems are the same 200 under both models, so independent CIs on each accuracy throw away the pairing and overstate the uncertainty on the difference. Bootstrapping the per-problem difference instead controls for the fact that some problems are simply harder:
 
-A few decisions worth scrutinizing:
+```python
+diff = ft_correct - baseline_correct            # per-problem, in {-1, 0, 1}
+rng = np.random.default_rng(123)
+diff_boots = np.array([diff[rng.integers(0, len(diff), len(diff))].mean()
+                       for _ in range(2000)])
+diff_ci = np.percentile(diff_boots, [2.5, 97.5])
+p_value = (diff_boots <= 0).mean()
+```
 
-- **Teacher contamination.** Claude Haiku 4.5 has very likely seen GSM8K during training, so its CoTs may not be independent of the eval set. The student model never sees the test split directly, but the teacher's "knowledge" of GSM8K is implicitly in the training signal. This caveat applies to most CoT distillation work and is not unique to this project, but it should temper conclusions.
-- **Rejection sampling biases the dataset.** Filtering to only-correct CoTs means the student trains exclusively on successful reasoning patterns. This is the standard recipe but it removes the model's exposure to "this looks like reasoning but produces wrong answers" — which is arguably part of what the model needs to internalize to *avoid* hallucinated reasoning.
-- **`answers_match` accepts unit conversions** (cents↔dollars, minutes↔hours). Without this, ~5% of correct CoTs would be incorrectly filtered out due to unit mismatches between Claude's reasoning and GSM8K's gold format. The same comparison logic was used at training-data filtering and at eval time — so the comparison is internally consistent.
+```
+Baseline:    10.5%  [95% CI:  6.5%, 14.5%]
+Fine-tuned:  12.5%  [95% CI:  8.0%, 17.5%]
+Paired Δ:    +2.0pp [95% CI: -3.0pp, +7.0pp]
+P(Δ ≤ 0) ≈ 0.241
+```
 
-## What I learned
+At 200 problems and a ~10% base rate, the CI half-width is around 5pp no matter what you do, so this design could never have resolved a 2pp effect. Detecting it would need something on the order of a thousand problems. I sized the eval before I knew how small the effect would be; sizing it from a power calculation instead would have been the better move, and it would have cost about 40 minutes more of T4 time.
 
-A handful of takeaways more durable than the +2pp number:
+## Caveats that could change the conclusion
 
-**Examples beat instructions.** I started with a system prompt telling Claude to reason in dollars rather than cents. It didn't work — Claude consistently produced `#### 300` for problems with gold answer `3` (300 cents = $3). Verifying the prompt was actually being delivered confirmed the model was just ignoring the instruction. Adding three few-shot demonstrations that *showed* the cent-to-dollar conversion fixed it on the first try. The lesson: when an LLM ignores an instruction, the fix is almost always more examples, not stronger wording. This generalizes to nearly any LLM-in-the-loop pipeline.
+**Teacher contamination.** Haiku 4.5 has almost certainly seen GSM8K. Its CoTs are therefore not independent of the benchmark, even though the student never touches the test split. This is endemic to CoT distillation papers on public benchmarks and it is a reason to treat GSM8K numbers as a sanity check rather than evidence.
 
-**Distillation has a capacity ceiling.** The same recipe that produces large gains at scale (DeepSeek's R1 distillation onto larger students) produces a ~2pp gain at 360M. The bottleneck isn't the data, the optimizer, or the teacher — it's the student's representational capacity. A 360M model has a hard ceiling on multi-step arithmetic that no amount of CoT scaffolding fixes. Realizing this changed how I think about scaling laws: parameter count isn't just about "more capacity" abstractly, it's the difference between a model that can and cannot perform a specific cognitive operation.
+**Rejection sampling narrows the distribution.** Training only on chains that landed on the right answer means the student never sees reasoning that looks plausible and ends up wrong. That is the standard recipe, but it is plausibly part of why the model happily produces confident, well-formatted nonsense: it has no examples of what failure looks like.
 
-**Eval is half the project.** Building the eval harness *before* the training cell — and verifying the baseline number first — caught a bug in answer extraction that would have invalidated the entire delta. The discipline that matters: never trust a delta where the baseline wasn't measured rigorously, and always test the comparison logic on hand-picked edge cases (cents-vs-dollars, float-vs-int, multiple-numbers-in-output) before trusting it on a thousand examples.
+**One seed, one run.** No variance estimate over training runs. A 2pp difference is well within what seed variation alone could produce for a run this small.
 
-**Greedy decoding has failure modes you should know about.** Repetition collapse is not a model bug; it's a property of greedy sampling on small models with high-confidence ruts. Sampling with low temperature broke some loops but didn't help accuracy, suggesting the loops are symptoms of capacity exhaustion rather than decoding pathology. Useful intuition for any future inference work.
+**Grader leniency**, discussed above.
 
-**Model choice matters more than recipe at small scale.** A side experiment showed that the same distillation recipe on Qwen2.5-1.5B started from a 67% baseline — meaning there was almost no headroom for distillation to demonstrate gains. The takeaway: the "right" base model for a distillation experiment is one with measurable headroom on the target benchmark. Picking too capable a starting point hides the recipe's effect; picking too weak a starting point shows you what the recipe *can't* do (which is what this project does).
+## Notes from building it
 
-**Free compute is real but constrained.** The whole project ran on a free Kaggle T4 plus ~$3 in Anthropic API costs. The constraints — 30 hr/week GPU budget, 16GB VRAM, no multi-GPU — forced design decisions (LoRA over full fine-tuning, 360M base, batch size 4 with gradient accumulation) that turned out to be the right ones anyway. I'd recommend the constraints. They make you pick problems where the bottleneck is your understanding, not your wallet.
+A few things I would tell myself at the start.
 
-## Why I'm reporting this honestly
+Examples beat instructions, and it is not close. My first system prompt told Claude to reason in dollars rather than cents. Claude ignored it, steadily, producing `#### 300` where gold was `3`. I checked that the prompt was actually reaching the API before blaming the model. Three few-shot demonstrations that *showed* a cent-to-dollar conversion fixed it on the first attempt. When a model ignores an instruction, adding more forceful wording is usually the wrong reflex; show it the behavior instead.
 
-A 360M model going from 10.5% to 12.5% on GSM8K is not a flashy headline. It would be tempting to either drop the project, run it on a bigger base model until I got a prettier number, or fudge the eval. I chose not to because:
+Build the eval before the training cell. I measured the baseline first, and doing so surfaced a bug in answer extraction that would have quietly invalidated the delta. A number you obtained after training, with no rigorously-measured before, is not a result. Related: test the comparison function on hand-picked adversarial cases (cents vs. dollars, `3.0` vs `3`, outputs containing five numbers) before you point it at a thousand examples.
 
-1. The methodology is the same — same pipeline, same rigor — whether the headline is +2pp or +20pp.
-2. The qualitative findings (style transfer, capability ceiling, failure modes) are *more* interesting than a flattering number.
-3. Reporting honestly is the part of ML I most want to be good at. Reaching for impressive numbers is the easiest way to lose a hiring manager who has done this work themselves.
+Choose a base model with headroom. I ran the same recipe against Qwen2.5-1.5B as a check and it started at roughly 67% on GSM8K, leaving almost nothing for distillation to demonstrate. Too capable a starting point hides the effect; too weak a starting point shows you what the method cannot do. The second is what happened here, and it turned out to be the more instructive outcome.
 
-If a smaller story told well is less appealing than a bigger story told sloppily, that's the signal I want to send.
+Constraints are clarifying. A free T4 with 16GB and a weekly quota forced LoRA over full fine-tuning, a 360M base, and batch 4 with gradient accumulation. Every one of those was the right call anyway. Working under a budget pushes you toward problems where the bottleneck is your understanding rather than your hardware.
 
-## What I'd do next
+And the obvious one: a 360M model going from 10.5% to 12.5% is not a headline. I could have swapped in a bigger base until the number looked better, or quietly reported the marginal CIs instead of the paired one. The pipeline and the rigor are the same either way, and the qualitative finding (format transfers, capability does not) is more interesting than a flattering delta would have been.
 
-Concrete extensions that fit the same infrastructure:
+## What I would do next
 
-- **GRPO instead of SFT.** With verifiable rewards on GSM8K (binary: did the final answer match gold?), the same 1,500-problem dataset can be used as RL training data. This is the natural follow-on and is an active research area (DeepSeek-R1's recipe).
-- **Larger student.** Same recipe on Qwen2.5-1.5B or Llama-3.2-1B would test whether the +2pp ceiling is specifically a 360M-scale phenomenon or a property of the recipe itself.
-- **Process reward modeling.** Training a verifier on intermediate reasoning steps (not just final answers) could break the "correct format, wrong arithmetic" failure mode by penalizing bad sub-steps directly.
+**Fix the eval first.** 1,000+ held-out problems and a tighter grader, so any subsequent claim is actually measurable. Cheap, unglamorous, and a precondition for everything else on this list.
 
-## Reproducibility
+**GRPO instead of SFT.** GSM8K rewards are verifiable (did the final answer match?), which is exactly the setting where policy-gradient RL beats imitation. The same 1,500 problems become RL prompts without regenerating any teacher data.
 
-The full pipeline is in [`smollm2_cot_distillation_polished.ipynb`](smollm2_cot_distillation_polished.ipynb). All seeds are fixed (`random.seed(7)` for problem selection, `random.seed(42)` for splits, `np.random.default_rng(42)` for bootstrap). Training reproduces deterministically on a Kaggle T4 with the pinned package versions in the notebook's first cell.
+**A larger student.** Qwen2.5-1.5B or Llama-3.2-1B under the identical recipe would separate "the ceiling is 360M" from "the ceiling is this recipe."
 
-To run inference on the trained model:
+**Process reward modeling.** The dominant failure mode is a correct plan with one bad step. Grading intermediate steps rather than only final answers targets that directly, and it is the natural fix for a model that has learned to look right.
+
+## Reproducing it
+
+Open `smollm2_cot_distillation_polished.ipynb` on Kaggle with a T4 accelerator, set `ANTHROPIC_API_KEY` and `HF_TOKEN` as Kaggle secrets, and run top to bottom. Budget roughly 45 min for generation, 10 min for baseline eval, 20 min for training, 10 min for the fine-tuned eval, and $3 of API credit.
+
+The generation stage is cached: if `filtered_cots.json` already exists in the working directory the notebook skips the API calls entirely, so you can re-run the training and eval sections without paying twice.
+
+Seeds are fixed throughout (`random.seed(7)` for teacher problem selection, `random.seed(42)` for the train/eval split and the held-out sample, `np.random.default_rng(42)` and `(123)` for the two bootstraps). Greedy decoding makes eval deterministic. Training on the same GPU and pinned versions reproduces closely, though not bit-for-bit across different hardware.
+
+A setup note that cost me an hour: the notebook explicitly uninstalls `bitsandbytes`. Kaggle's preinstalled `triton` is incompatible with `bitsandbytes==0.44.1`'s import path, and bf16 LoRA on a 360M model does not need 8-bit quantization anyway. TRL is likewise skipped in favor of `transformers.Trainer` plus `peft` directly, which is fewer moving parts for a job this simple.
+
+Inference on the trained adapter, merged and pushed to the Hub:
 
 ```python
 from transformers import pipeline
-pipe = pipeline("text-generation", model="kianshandi/smollm2-360m-gsm8k-distilled-haiku")
-pipe([{"role": "user", "content": "If a pencil costs 30 cents, how much do 4 pencils cost?"}])
+
+pipe = pipeline("text-generation",
+                model="kianshandi/smollm2-360m-gsm8k-distilled-haiku")
+pipe([{"role": "user",
+       "content": "If a pencil costs 30 cents, how much do 4 pencils cost?"}],
+     max_new_tokens=256, do_sample=False)
 ```
 
-## Hyperparameters (full)
+## Configuration
 
 | | |
 |---|---|
 | Base model | `HuggingFaceTB/SmolLM2-360M-Instruct` |
-| Teacher model | `claude-haiku-4-5` |
-| Training data | 1,435 filtered (question, CoT) pairs |
-| LoRA rank / alpha | 16 / 32 |
+| Teacher | `claude-haiku-4-5` |
+| Teacher calls | 1,500 (3 few-shot demos + system prompt per call) |
+| Training data | 1,435 filtered (question, CoT) pairs; 1,385 train / 50 eval |
+| LoRA rank / alpha / dropout | 16 / 32 / 0.05 |
 | LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
-| Epochs | 3 |
-| Effective batch size | 16 (per-device 4 × grad-accum 4) |
-| Learning rate | 2e-4 (cosine schedule, 5% warmup) |
+| Epochs | 3 (~260 optimizer steps) |
+| Effective batch size | 16 (per-device 4 × grad accum 4) |
+| Learning rate | 2e-4, cosine, 5% warmup |
 | Precision | bf16 |
-| Max sequence length | 1024 |
-| Held-out test set | 200 problems from GSM8K test split |
-| Decoding | greedy (`do_sample=False`) |
-| Compute | 1 × NVIDIA T4 (Kaggle free tier) |
-| Wall-clock training time | ~20 min |
-| API cost | ~$2.70 (Anthropic Haiku 4.5) |
+| Max sequence length | 1,024 |
+| Held-out test set | 200 problems, GSM8K test split |
+| Decoding | greedy, 512 max new tokens, batch 8, left-padded |
+| Compute | 1 × NVIDIA T4, Kaggle free tier |
+| Training wall clock | ~20 min |
+| API cost | ~$2.70 |
 
-## License & acknowledgements
+## License and credits
 
-Base model: SmolLM2-360M-Instruct (Apache 2.0) by HuggingFaceTB. Training data derived from GSM8K (MIT) via Claude Haiku 4.5 (Anthropic). This adapter is released under Apache 2.0.
+Base model: [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (Apache 2.0), HuggingFaceTB. Problems from [GSM8K](https://github.com/openai/grade-school-math) (MIT), OpenAI. Chain-of-thought solutions generated with Claude Haiku 4.5 (Anthropic). The adapter in this repo is released under Apache 2.0.
 
-Built as a portfolio project at UCLA, 2026.
+Built at UCLA, 2026.
